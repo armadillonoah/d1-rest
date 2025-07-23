@@ -16,7 +16,7 @@
     ],
     "secrets_store_secrets": [
         {
-            "store_id": "<aa2dbcd4d6e34f43b985edec22b6cabc>",
+            "store_id": "aa2dbcd4d6e34f43b985edec22b6cabc",
             "binding": "SECRET",
             "secret_name": "api-key"
         }
