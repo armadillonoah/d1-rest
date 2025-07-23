@@ -18,7 +18,7 @@
         {
             "store_id": "<aa2dbcd4d6e34f43b985edec22b6cabc>",
             "binding": "SECRET",
-            "secret_name": "<api-key>"
+            "secret_name": "api-key"
         }
     ],
 	"observability": {
