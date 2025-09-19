@@ -1,77 +1,101 @@
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
+import { Hono, Context, Next } from "hono";
+import { cors } from "hono/cors";
 import { handleRest } from './rest';
 
 export interface Env {
-    DB?: D1Database;
+    DB: D1Database;
     'verified-clean'?: D1Database;
-    SECRET: string;
+    SECRET: SecretsStoreSecret;
 }
 
-const app = new Hono<{ Bindings: Env }>();
+// # List all users
+// GET /rest/users
 
-app.use('*', cors());
+// # Get filtered and sorted users
+// GET /rest/users?age=25&sort_by=name&order=desc
 
-// Middleware to use the correct database
-app.use('*', async (c, next) => {
-    // Use verified-clean if available, otherwise fall back to DB
-    const db = c.env['verified-clean'] || c.env.DB;
-    if (!db) {
-        return c.json({ error: 'No database binding found' }, 500);
+// # Get paginated results
+// GET /rest/users?limit=10&offset=20
+
+// # Create a new user
+// POST /rest/users
+// { "name": "John", "age": 30 }
+
+// # Update a user
+// PATCH /rest/users/123
+// { "age": 31 }
+
+// # Delete a user
+// DELETE /rest/users/123
+
+export default {
+    async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+        const app = new Hono<{ Bindings: Env }>();
+
+        // Apply CORS to all routes
+        app.use('*', async (c, next) => {
+            return cors()(c, next);
+        })
+
+        // Secret Store key value that we have set
+        const secret = await env.SECRET.get();
+
+        // Authentication middleware that verifies the Authorization header
+        // is sent in on each request and matches the value of our Secret key.
+        // If a match is not found we return a 401 and prevent further access.
+        const authMiddleware = async (c: Context, next: Next) => {
+            const authHeader = c.req.header('Authorization');
+            if (!authHeader) {
+                return c.json({ error: 'Unauthorized' }, 401);
+            }
+
+            const token = authHeader.startsWith('Bearer ')
+                ? authHeader.substring(7)
+                : authHeader;
+
+            if (token !== secret) {
+                return c.json({ error: 'Unauthorized' }, 401);
+            }
+
+            return next();
+        };
+
+        // CRUD REST endpoints made available to all of our tables
+        app.all('/rest/*', authMiddleware, async (c) => {
+            // Use verified-clean database for compliance_events table
+            const path = c.req.path;
+            if (path.includes('compliance_events') && env['verified-clean']) {
+                // Temporarily swap DB binding for this request
+                const originalDB = env.DB;
+                env.DB = env['verified-clean'];
+                const response = await handleRest(c);
+                env.DB = originalDB;
+                return response;
+            }
+            return handleRest(c);
+        });
+
+        // Execute a raw SQL statement with parameters with this route
+        app.post('/query', authMiddleware, async (c) => {
+            try {
+                const body = await c.req.json();
+                const { query, params } = body;
+
+                if (!query) {
+                    return c.json({ error: 'Query is required' }, 400);
+                }
+
+                // Execute the query against D1 database
+                const results = await env.DB.prepare(query)
+                    .bind(...(params || []))
+                    .all();
+
+                return c.json(results);
+            } catch (error: any) {
+                return c.json({ error: error.message }, 500);
+            }
+        });
+
+        return app.fetch(request, env, ctx);
     }
-    // Store the database reference for other handlers to use
-    c.set('database', db);
-    await next();
-});
-
-// Auth middleware for /rest and /query routes
-app.use('/rest/*', async (c, next) => {
-    const authHeader = c.req.header('Authorization');
-    const secret = typeof c.env.SECRET === 'string' ? c.env.SECRET : await c.env.SECRET?.value();
-
-    // Debug logging
-    console.log('Auth check - Header:', authHeader ? 'present' : 'missing');
-    console.log('Secret type:', typeof c.env.SECRET);
-
-    if (authHeader !== secret) {
-        return c.json({ error: 'Unauthorized' }, 401);
-    }
-    await next();
-});
-
-app.use('/query', async (c, next) => {
-    const authHeader = c.req.header('Authorization');
-    const secret = typeof c.env.SECRET === 'string' ? c.env.SECRET : await c.env.SECRET?.value();
-
-    if (authHeader !== secret) {
-        return c.json({ error: 'Unauthorized' }, 401);
-    }
-    await next();
-});
-
-// Handle REST API endpoints
-app.all('/rest/:table/:id?', handleRest);
-
-// Handle raw SQL queries
-app.post('/query', async (c) => {
-    try {
-        const body = await c.req.json();
-        const { query, params } = body;
-
-        if (!query) {
-            return c.json({ error: 'No query provided' }, 400);
-        }
-
-        // Use the database from middleware
-        const db = c.get('database') as D1Database;
-        const results = await db.prepare(query)
-            .bind(...(params || []))
-            .all();
-
-        return c.json(results);
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 400);
-    }
-});
-
-export default app;
+} satisfies ExportedHandler<Env>;

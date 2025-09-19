@@ -1,182 +1,184 @@
 import { Context } from 'hono';
+import type { Env } from './index';
 
-const sanitizeIdentifier = (str: string): string => {
-    return str.replace(/[^a-zA-Z0-9_]/g, '');
-};
+/**
+ * Sanitizes an identifier by removing all non-alphanumeric characters except underscores.
+ */
+function sanitizeIdentifier(identifier: string): string {
+    return identifier.replace(/[^a-zA-Z0-9_]/g, '');
+}
 
-const sanitizeValue = (value: any): any => {
-    if (typeof value === 'string') {
-        // Basic SQL injection prevention - in production, use parameterized queries
-        return value.replace(/'/g, "''");
-    }
-    return value;
-};
+/**
+ * Processing when the table name is a keyword in SQLite.
+ */
+function sanitizeKeyword(identifier: string): string {
+    return '`'+sanitizeIdentifier(identifier)+'`';
+}
 
-export async function handleGet(c: Context) {
-    const table = sanitizeIdentifier(c.req.param('table') || '');
-    const id = c.req.param('id');
+/**
+ * Handles GET requests to fetch records from a table
+ */
+async function handleGet(c: Context<{ Bindings: Env }>, tableName: string, id?: string): Promise<Response> {
+    const table = sanitizeKeyword(tableName);
+    const searchParams = new URL(c.req.url).searchParams;
+    
+    try {
+        let query = `SELECT * FROM ${table}`;
+        const params: any[] = [];
+        const conditions: string[] = [];
 
-    // Get database from middleware
-    const db = c.get('database') as D1Database;
+        // Handle ID filter
+        if (id) {
+            conditions.push('id = ?');
+            params.push(id);
+        }
 
-    let query = `SELECT * FROM \`${table}\``;
-    const params: any[] = [];
-
-    if (id) {
-        query += ` WHERE id = ?`;
-        params.push(id);
-    }
-
-    // Handle query parameters for filtering
-    const url = new URL(c.req.url);
-    const filters: string[] = [];
-
-    url.searchParams.forEach((value, key) => {
-        if (key !== 'sort' && key !== 'limit' && key !== 'offset') {
-            filters.push(`${sanitizeIdentifier(key)} = ?`);
+        // Handle search parameters (basic filtering)
+        for (const [key, value] of searchParams.entries()) {
+            if (['sort_by', 'order', 'limit', 'offset'].includes(key)) continue;
+            
+            const sanitizedKey = sanitizeIdentifier(key);
+            conditions.push(`${sanitizedKey} = ?`);
             params.push(value);
         }
-    });
 
-    if (filters.length > 0 && !id) {
-        query += ` WHERE ${filters.join(' AND ')}`;
-    }
+        // Add WHERE clause if there are conditions
+        if (conditions.length > 0) {
+            query += ` WHERE ${conditions.join(' AND ')}`;
+        }
 
-    // Handle sorting
-    const sort = url.searchParams.get('sort');
-    if (sort) {
-        const [field, order] = sort.split(':');
-        query += ` ORDER BY ${sanitizeIdentifier(field)} ${order === 'desc' ? 'DESC' : 'ASC'}`;
-    }
+        // Handle sorting
+        const sortBy = searchParams.get('sort_by');
+        if (sortBy) {
+            const order = searchParams.get('order')?.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+            query += ` ORDER BY ${sanitizeIdentifier(sortBy)} ${order}`;
+        }
 
-    // Handle pagination
-    const limit = url.searchParams.get('limit');
-    const offset = url.searchParams.get('offset');
-    if (limit) {
-        query += ` LIMIT ${parseInt(limit)}`;
-    }
-    if (offset) {
-        query += ` OFFSET ${parseInt(offset)}`;
-    }
+        // Handle pagination
+        const limit = searchParams.get('limit');
+        if (limit) {
+            query += ` LIMIT ?`;
+            params.push(parseInt(limit));
 
-    try {
-        const results = await db.prepare(query)
+            const offset = searchParams.get('offset');
+            if (offset) {
+                query += ` OFFSET ?`;
+                params.push(parseInt(offset));
+            }
+        }
+
+        const results = await c.env.DB.prepare(query)
             .bind(...params)
             .all();
 
         return c.json(results);
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 400);
+    } catch (error: any) {
+        return c.json({ error: error.message }, 500);
     }
 }
 
-export async function handlePost(c: Context) {
-    const table = sanitizeIdentifier(c.req.param('table') || '');
+/**
+ * Handles POST requests to create new records
+ */
+async function handlePost(c: Context<{ Bindings: Env }>, tableName: string): Promise<Response> {
+    const table = sanitizeKeyword(tableName);
     const data = await c.req.json();
 
-    // Get database from middleware
-    const db = c.get('database') as D1Database;
-
-    if (Array.isArray(data)) {
-        return c.json({ error: 'Batch insert not supported' }, 400);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return c.json({ error: 'Invalid data format' }, 400);
     }
 
-    const columns = Object.keys(data).map(sanitizeIdentifier);
-    const placeholders = columns.map(() => '?').join(', ');
-    const values = Object.values(data);
-
-    const query = `INSERT INTO \`${table}\` (${columns.join(', ')}) VALUES (${placeholders})`;
-
     try {
-        const result = await db.prepare(query)
-            .bind(...values)
+        const columns = Object.keys(data).map(sanitizeIdentifier);
+        const placeholders = columns.map(() => '?').join(', ');
+        const query = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`;
+        const params = columns.map(col => data[col]);
+
+        const result = await c.env.DB.prepare(query)
+            .bind(...params)
             .run();
 
-        return c.json({
-            success: result.success,
-            meta: result.meta
-        }, 201);
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 400);
+        return c.json({ message: 'Resource created successfully', data }, 201);
+    } catch (error: any) {
+        return c.json({ error: error.message }, 500);
     }
 }
 
-export async function handleUpdate(c: Context) {
-    const table = sanitizeIdentifier(c.req.param('table') || '');
-    const id = c.req.param('id');
+/**
+ * Handles PUT/PATCH requests to update records
+ */
+async function handleUpdate(c: Context<{ Bindings: Env }>, tableName: string, id: string): Promise<Response> {
+    const table = sanitizeKeyword(tableName);
     const data = await c.req.json();
 
-    // Get database from middleware
-    const db = c.get('database') as D1Database;
-
-    if (!id) {
-        return c.json({ error: 'ID required for update' }, 400);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        return c.json({ error: 'Invalid data format' }, 400);
     }
 
-    const updates = Object.keys(data)
-        .map(key => `${sanitizeIdentifier(key)} = ?`)
-        .join(', ');
-
-    const values = Object.values(data);
-    values.push(id); // Add ID for WHERE clause
-
-    const query = `UPDATE \`${table}\` SET ${updates} WHERE id = ?`;
-
     try {
-        const result = await db.prepare(query)
-            .bind(...values)
+        const setColumns = Object.keys(data)
+            .map(sanitizeIdentifier)
+            .map(col => `${col} = ?`)
+            .join(', ');
+
+        const query = `UPDATE ${table} SET ${setColumns} WHERE id = ?`;
+        const params = [...Object.values(data), id];
+
+        const result = await c.env.DB.prepare(query)
+            .bind(...params)
             .run();
 
-        return c.json({
-            success: result.success,
-            meta: result.meta
-        });
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 400);
+        return c.json({ message: 'Resource updated successfully', data });
+    } catch (error: any) {
+        return c.json({ error: error.message }, 500);
     }
 }
 
-export async function handleDelete(c: Context) {
-    const table = sanitizeIdentifier(c.req.param('table') || '');
-    const id = c.req.param('id');
-
-    // Get database from middleware
-    const db = c.get('database') as D1Database;
-
-    if (!id) {
-        return c.json({ error: 'ID required for delete' }, 400);
-    }
-
-    const query = `DELETE FROM \`${table}\` WHERE id = ?`;
+/**
+ * Handles DELETE requests to remove records
+ */
+async function handleDelete(c: Context<{ Bindings: Env }>, tableName: string, id: string): Promise<Response> {
+    const table = sanitizeKeyword(tableName);
 
     try {
-        const result = await db.prepare(query)
+        const query = `DELETE FROM ${table} WHERE id = ?`;
+        const result = await c.env.DB.prepare(query)
             .bind(id)
             .run();
 
-        return c.json({
-            success: result.success,
-            meta: result.meta
-        });
-    } catch (error) {
-        return c.json({ error: (error as Error).message }, 400);
+        return c.json({ message: 'Resource deleted successfully' });
+    } catch (error: any) {
+        return c.json({ error: error.message }, 500);
     }
 }
 
-export async function handleRest(c: Context) {
-    const method = c.req.method;
+/**
+ * Main REST handler that routes requests to appropriate handlers
+ */
+export async function handleRest(c: Context<{ Bindings: Env }>): Promise<Response> {
+    const url = new URL(c.req.url);
+    const pathParts = url.pathname.split('/').filter(Boolean);
+    
+    if (pathParts.length < 2) {
+        return c.json({ error: 'Invalid path. Expected format: /rest/{tableName}/{id?}' }, 400);
+    }
 
-    switch (method) {
+    const tableName = pathParts[1];
+    const id = pathParts[2];
+    
+    switch (c.req.method) {
         case 'GET':
-            return handleGet(c);
+            return handleGet(c, tableName, id);
         case 'POST':
-            return handlePost(c);
+            return handlePost(c, tableName);
         case 'PUT':
         case 'PATCH':
-            return handleUpdate(c);
+            if (!id) return c.json({ error: 'ID is required for updates' }, 400);
+            return handleUpdate(c, tableName, id);
         case 'DELETE':
-            return handleDelete(c);
+            if (!id) return c.json({ error: 'ID is required for deletion' }, 400);
+            return handleDelete(c, tableName, id);
         default:
             return c.json({ error: 'Method not allowed' }, 405);
     }
-}
+} 
