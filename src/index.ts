@@ -26,14 +26,24 @@ app.use('*', async (c, next) => {
 
 // Auth middleware for /rest and /query routes
 app.use('/rest/*', async (c, next) => {
-    if (c.req.header('Authorization') !== c.env.SECRET) {
+    const authHeader = c.req.header('Authorization');
+    const secret = typeof c.env.SECRET === 'string' ? c.env.SECRET : await c.env.SECRET?.value();
+
+    // Debug logging
+    console.log('Auth check - Header:', authHeader ? 'present' : 'missing');
+    console.log('Secret type:', typeof c.env.SECRET);
+
+    if (authHeader !== secret) {
         return c.json({ error: 'Unauthorized' }, 401);
     }
     await next();
 });
 
 app.use('/query', async (c, next) => {
-    if (c.req.header('Authorization') !== c.env.SECRET) {
+    const authHeader = c.req.header('Authorization');
+    const secret = typeof c.env.SECRET === 'string' ? c.env.SECRET : await c.env.SECRET?.value();
+
+    if (authHeader !== secret) {
         return c.json({ error: 'Unauthorized' }, 401);
     }
     await next();
